@@ -1,0 +1,164 @@
+import numpy as np
+from scipy.spatial import KDTree
+
+# Constants
+ELEMENT_SYMBOLS = np.array(["H", "HE", "C", "N", "O", "F", "NA", "MG", "P", "S", 
+                            "CL", "K", "CA", "NI", "CU", "ZN", "SE", "BR", "CD", 
+                            "I", "HG"])
+ELEMENT_RADII = np.array([1.200, 1.400, 1.700, 1.550, 1.520, 1.470, 2.270, 1.730, 
+                          1.800, 1.800, 1.750, 2.750, 2.310, 1.630, 1.400, 1.390, 
+                          1.900, 1.850, 1.580, 1.980, 1.550])
+SOLVENT_RADIUS = 1.4
+
+def parse_pdb_file(pdb_file):
+    """
+    Parses a PDB file to extract atomic coordinates and element symbols.
+
+    Parameters:
+    pdb_file (str): Path to the PDB file.
+
+    Returns:
+    tuple: A tuple containing two numpy arrays, one for numeric data 
+           (atomic coordinates) and one for string data (element symbols).
+    """
+    numeric_data = []
+    string_data = []
+    with open(pdb_file, 'r') as file:
+        for line in file:
+            if line.startswith('ATOM') or line.startswith('HETATM'):
+                x_coordinate = float(line[30:38].strip())
+                y_coordinate = float(line[38:46].strip())
+                z_coordinate = float(line[46:54].strip())
+                numeric_data.append([x_coordinate, y_coordinate, z_coordinate])
+                
+                atom_name = line[12:16].strip()
+                element_symbol = line[76:78].strip()
+                string_data.append([atom_name, element_symbol])
+
+    return np.array(numeric_data), np.array(string_data)
+
+def get_radius_vectorized(elements, symbols, radii):
+    """
+    Finds the radii for a given array of element symbols.
+
+    Parameters:
+    elements (numpy array): Array of element symbols.
+    symbols (numpy array): Array of available element symbols.
+    radii (numpy array): Array of corresponding radii for the elements.
+
+    Returns:
+    numpy array: Array of radii for the given element symbols.
+    """
+    index = np.searchsorted(symbols, elements, side='left')
+    valid_indices = index < len(radii)
+    radii_found = np.zeros_like(elements, dtype=float)
+    radii_found[valid_indices] = radii[index[valid_indices]]
+    return radii_found
+
+def calc_points_vectorized(center, radius, n):
+    """
+    Calculates points on the surface of a sphere given a center and radius.
+
+    Parameters:
+    center (list): The center of the sphere (x, y, z coordinates).
+    radius (float): The radius of the sphere.
+    n (int): Number of points to calculate on the sphere's surface.
+
+    Returns:
+    numpy array: An array of points on the surface of the sphere.
+    """
+    points = np.zeros((n, 3))
+    N = n
+    theta = np.arccos(-1 + 2 * np.linspace(0, N - 1, N) / float(N - 1))
+    theta[0] += 1e-6  # Small offset to avoid division by zero
+    theta[-1] -= 1e-6
+
+    phi_increment = 3.6 / np.sqrt(N * (1 - np.square(np.cos(theta))))
+    phi = np.cumsum(np.concatenate(([0], phi_increment[:-1]))) % (2 * np.pi)
+
+    x = center[0] + radius * np.sin(phi) * np.sin(theta)
+    y = center[1] + radius * np.cos(phi) * np.sin(theta)
+    z = center[2] - radius * np.cos(theta)
+
+    return np.column_stack((x, y, z))
+
+
+def create_kd_tree(numeric_atoms):
+    """
+    Creates a KD-tree from the atomic coordinates for efficient nearest neighbor search.
+
+    Parameters:
+    numeric_atoms (numpy array): Array of atomic coordinates.
+
+    Returns:
+    KDTree: A KD-tree of the atomic coordinates.
+    """
+    return KDTree(numeric_atoms)
+
+def is_accessible_kd_tree(point, current_atom_index, numeric_atoms, atomic_radii, kd_tree):
+    """
+    Determines if a point on a sphere is accessible, considering only nearest neighbors.
+
+    Parameters:
+    point (numpy array): The point to check.
+    current_atom_index (int): Index of the current atom.
+    numeric_atoms (numpy array): Array of coordinates of other atoms.
+    atomic_radii (numpy array): Array of radii of the atoms.
+    kd_tree (KDTree): A KD-tree of the atomic coordinates.
+
+    Returns:
+    bool: True if the point is accessible, False otherwise.
+    """
+    # Define a search radius that is sufficiently large to include relevant neighbors
+    search_radius = SOLVENT_RADIUS + max(atomic_radii)
+    nearby_indices = kd_tree.query_ball_point(point, search_radius)
+
+    # Remove the current atom index from the nearby indices if it's present
+    if current_atom_index in nearby_indices:
+        nearby_indices.remove(current_atom_index)
+
+    filtered_atoms = numeric_atoms[nearby_indices]
+    filtered_radii = atomic_radii[nearby_indices]
+
+    distances = np.sqrt(np.sum(np.square(filtered_atoms - point), axis=1))
+    return np.all(distances >= filtered_radii + SOLVENT_RADIUS)
+
+
+def calculate_sasa_kd_tree(numeric_atoms, string_data, symbols, radii, num_points=100):
+    """
+    Optimized calculation of Surface Accessible Solvent Area (SASA) using KD-tree.
+
+    Parameters:
+    numeric_atoms (numpy array): Array of atomic coordinates.
+    string_data (numpy array): Array of element symbols.
+    symbols (numpy array): Array of available element symbols.
+    radii (numpy array): Array of corresponding radii for the elements.
+    num_points (int): Number of points to calculate on each atom's surface.
+
+    Returns:
+    float: The calculated SASA value.
+    """
+    sasa = 0.0
+    atomic_radii = get_radius_vectorized(string_data[:, 1], symbols, radii)
+    adjusted_radii = atomic_radii + SOLVENT_RADIUS
+    area_per_point = 4 * np.pi * np.square(adjusted_radii) / num_points
+
+    kd_tree = create_kd_tree(numeric_atoms)
+
+    for i in range(numeric_atoms.shape[0]):
+        surface_points = calc_points_vectorized(numeric_atoms[i], adjusted_radii[i], num_points)
+        accessible_points = np.sum([is_accessible_kd_tree(point, i, numeric_atoms, atomic_radii, kd_tree) for point in surface_points])
+        sasa += accessible_points * area_per_point[i]
+
+    return sasa
+
+# Example usage
+# numeric_atoms, string_data = parse_pdb_file("small_h.pdb")
+# sasa_kd_tree = calculate_sasa_kd_tree(numeric_atoms, string_data, ELEMENT_SYMBOLS, ELEMENT_RADII)
+# print(f"KD-Tree SASA: {sasa_kd_tree} Å²")
+
+
+
+numeric_atoms, string_data = parse_pdb_file("small_h.pdb")
+sasa = calculate_sasa_kd_tree(numeric_atoms, string_data, ELEMENT_SYMBOLS, ELEMENT_RADII)
+print(f"SASA: {sasa} Å²")
